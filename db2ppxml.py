@@ -357,6 +357,7 @@ def make_taxonomy_level(etree, pel, level_r):
         output_els[level_r["uuid"]] = level
         make_prop(level, level_r, "id", "uuid")
         make_prop(level, level_r, "name")
+        make_prop(level, level_r, "description")
         make_prop(level, level_r, "color")
 
         if level_r["parent"]:
@@ -449,14 +450,31 @@ def main():
         make_attributes(sec, attr_rows)
 
         events = ET.SubElement(sec, "events")
-        order_args = {}
-        if args.sort_events:
-            order_args = {"order": "date, details"}
-        for event_r in dbhelper.select("security_event", where="security='%s'" % sec_r["uuid"], **order_args):
-            event = ET.SubElement(events, "event")
-            make_prop(event, event_r, "date")
-            make_prop(event, event_r, "type")
-            make_prop(event, event_r, "details")
+        event_rows = []
+        for tag, table in (("event", "security_event"), ("dividendEvent", "security_event_dividend")):
+            for r in dbhelper.select(table, where="security='%s'" % sec_r["uuid"]):
+                if args.sort_events:
+                    # both tables sort the same way, so the merge below keeps date order
+                    key = (r["date"] or "", r["type"] or "")
+                else:
+                    key = (str(r["_order"] if r["_order"] is not None else r["_id"]).zfill(12),)
+                event_rows.append((key, tag, r))
+        for _, tag, r in sorted(event_rows, key=lambda x: x[0]):
+            event = ET.SubElement(events, tag)
+            if tag == "event":
+                make_prop(event, r, "date")
+                make_prop(event, r, "type")
+                make_prop(event, r, "details")
+            else:
+                make_prop(event, r, "date")
+                make_prop(event, r, "type")
+                make_prop(event, r, "source")
+                make_prop(event, r, "paymentDate")
+                if r["amount"] is not None:
+                    amount = ET.SubElement(event, "amount")
+                    amount.set("currency", r["currency"])
+                    amount.set("amount", str(r["amount"]))
+                    amount.wr_nb()
             event.wr_end()
         events.wr_end()
 
@@ -495,6 +513,29 @@ def main():
     portfolios.wr_end()
 
     plans = ET.SubElement(root, "plans")
+    for plan_r in dbhelper.select("plan", order="_order"):
+        plan = ET.SubElement(plans, "investment-plan")
+        make_prop(plan, plan_r, "name")
+        acc = ET.SubElement(plan, "account")
+        acc.set("reference", uuid2xmlid[plan_r["account"]])
+        acc.wr_nb()
+        attrs = ET.SubElement(plan, "attributes")
+        ET.SubElement(attrs, "map").wr_nb()
+        attrs.wr_end()
+        make_prop(plan, plan_r, "autoGenerate", conv=as_bool)
+        make_prop(plan, plan_r, "start")
+        make_prop(plan, plan_r, "interval")
+        make_prop(plan, plan_r, "amount")
+        make_prop(plan, plan_r, "fees")
+        make_prop(plan, plan_r, "taxes")
+        make_prop(plan, plan_r, "type")
+        txs = ET.SubElement(plan, "transactions")
+        for tx_r in dbhelper.select("plan_transaction", where="plan=%d" % plan_r["_id"], order="seq"):
+            pt = ET.SubElement(txs, "account-transaction")
+            pt.set("reference", uuid2xmlid[tx_r["xact"]])
+            pt.wr_nb()
+        txs.wr_end()
+        plan.wr_end()
     plans.wr_end()
 
     taxonomies = ET.SubElement(root, "taxonomies")
@@ -519,7 +560,12 @@ def main():
         dashb = ET.SubElement(dashboards, "dashboard")
         dashb.set("name", dashb_r["name"])
         make_prop(dashb, dashb_r, "id")
-        make_configuration(dashb, json.loads(dashb_r["config_json"]))
+        # PP writes <configuration/> for widgets even when empty, but omits the
+        # element for dashboards that have none - mirroring that keeps the
+        # round-trip diff clean
+        dashb_conf = json.loads(dashb_r["config_json"])
+        if dashb_conf:
+            make_configuration(dashb, dashb_conf)
         columns = ET.SubElement(dashb, "columns")
         for col_j in json.loads(dashb_r["columns_json"]):
             col = ET.SubElement(columns, "column")
